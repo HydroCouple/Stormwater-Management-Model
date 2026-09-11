@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file HydrologyHandler.cpp
  * @brief Section handlers for [EVAPORATION], [TEMPERATURE], [SNOWPACKS],
@@ -20,6 +36,7 @@
  * FILE  "filename"  StartDate
  * WINDSPEED  MONTHLY  1.0 1.0 ... (12 values)
  * WINDSPEED  FILE
+ * HUMIDITY  [DEWPOINT]  value | MONTHLY h1 ... h12 | TIMESERIES name
  * SNOWMELT  divT  ATIwt  nrgRatio  lat  minMelt  maxMelt
  * ADC  IMPERVIOUS  frac1  frac2  ... frac10
  * ADC  PERVIOUS    frac1  frac2  ... frac10
@@ -62,7 +79,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "HydrologyHandler.hpp"
@@ -71,6 +88,7 @@
 #include "../../core/SimulationContext.hpp"
 #include "../../data/SubcatchData.hpp"
 #include "../../data/HydrologyData.hpp"
+#include "../../hydrology/Groundwater.hpp"
 
 #include "../InputParseUtils.hpp"
 
@@ -224,6 +242,39 @@ void handle_temperature(SimulationContext& ctx, const std::vector<std::string>& 
                 ctx.options.wind_type = 1;
             }
         }
+        // H2: relative humidity, % — the met input SurfaceExchange needs and
+        // the first thing ever to write ClimateState::humidity, which has
+        // carried a 50 % default with no writer. Forms:
+        //   HUMIDITY [DEWPOINT] <value>
+        //   HUMIDITY [DEWPOINT] MONTHLY h1 ... h12
+        //   HUMIDITY [DEWPOINT] TIMESERIES <name>
+        // A bare value is CONSTANT and fills all twelve months. DEWPOINT
+        // stores dew-point temperature (project temperature units) that the
+        // engine converts to RH each step.
+        else if (key == "HUMIDITY" && tok.size() >= 2) {
+            std::size_t p = 1;
+            ctx.options.humidity_var = 0;
+            if (Tokenizer::to_upper(tok[p]) == "DEWPOINT") {
+                ctx.options.humidity_var = 1;
+                ++p;
+            }
+            if (p >= tok.size()) continue;
+            const std::string htype = Tokenizer::to_upper(tok[p]);
+            if (htype == "MONTHLY" && tok.size() >= p + 13) {
+                ctx.options.humidity_type = 1;
+                for (int i = 0; i < 12; ++i)
+                    ctx.options.humidity[i] = to_double(tok[p + 1 + static_cast<std::size_t>(i)]);
+            }
+            else if (htype == "TIMESERIES" && tok.size() >= p + 2) {
+                ctx.options.humidity_type = 2;
+                ctx.options.humidity_ts_name = tok[p + 1];
+            }
+            else if (htype != "MONTHLY" && htype != "TIMESERIES") {
+                ctx.options.humidity_type = 0;
+                const double h = to_double(tok[p]);
+                for (int i = 0; i < 12; ++i) ctx.options.humidity[i] = h;
+            }
+        }
         else if (key == "SNOWMELT" && tok.size() >= 7) {
             // Legacy [TEMPERATURE] SNOWMELT format (9 tokens):
             //   SNOWMELT divT ATIwt nrgRatio elev lat dtlong minMelt maxMelt
@@ -351,8 +402,15 @@ void handle_aquifers(SimulationContext& ctx, const std::vector<std::string>& lin
 void handle_groundwater(SimulationContext& ctx, const std::vector<std::string>& lines) {
     for (const auto& line : lines) {
         auto tok = Tokenizer::tokenize(line);
-        if (tok.size() < 11) continue;
+        if (tok.empty()) continue;
         // Subcatch  Aquifer  Node  SurfEl  A1  B1  A2  B2  A3  Twgr  Hstar
+        // Legacy gwater.c gwater_readGroundwaterParams requires >= 11 tokens;
+        // fewer is ERR_ITEMS (too few items). v6 formerly skipped short rows
+        // silently, so a truncated row ran instead of being rejected.
+        if (tok.size() < 11) {
+            ctx.errors.push_back(format_error(ERR_ITEMS, ""));
+            continue;
+        }
 
         const int idx = ctx.subcatch_names.find(tok[0]);
         if (idx < 0) continue;
@@ -361,6 +419,9 @@ void handle_groundwater(SimulationContext& ctx, const std::vector<std::string>& 
 
         ctx.subcatches.gw_aquifer[idx]   = ctx.aquifer_names.find(tok[1]);
         ctx.subcatches.gw_node[idx]      = ctx.node_names.find(tok[2]);
+        // [GROUNDWATER] normally precedes [JUNCTIONS], so the find() above
+        // returns -1 for a forward reference. Defer to PostParseResolver.
+        ctx.pending_gw_nodes.emplace_back(idx, tok[2]);
         ctx.subcatches.gw_surf_elev[idx] = to_double(tok[3]);
         ctx.subcatches.gw_a1[idx]        = to_double(tok[4]);
         ctx.subcatches.gw_b1[idx]        = to_double(tok[5]);
@@ -384,14 +445,53 @@ void handle_gwf(SimulationContext& ctx, const std::vector<std::string>& lines) {
         auto tok = Tokenizer::tokenize(line);
         if (tok.size() < 3) continue;
 
-        const std::string& subcatch = tok[0];
-        const std::string type = Tokenizer::to_upper(tok[1]);
+        // Key on the [SUBCATCHMENTS] spelling so a mixed-case name in [GWF]
+        // still matches the lookup at start() and the writer (both use the
+        // registry name). An unknown subcatchment keeps the typed name, as
+        // handle_groundwater() tolerates an unresolved name.
+        const std::string* canon = ctx.subcatch_names.canonical(tok[0]);
+        const std::string& subcatch = canon ? *canon : tok[0];
 
-        // Reconstruct expression from remaining tokens
-        std::string expr;
-        for (std::size_t i = 2; i < tok.size(); ++i) {
-            if (!expr.empty()) expr += ' ';
-            expr += tok[i];
+        // Legacy gwater.c accepts any "LAT..." spelling for LATERAL.
+        const std::string type_tok = Tokenizer::to_upper(tok[1]);
+        std::string type;
+        if (type_tok.rfind("LAT", 0) == 0) type = "LATERAL";
+        else if (type_tok == "DEEP")       type = "DEEP";
+        else {
+            ctx.errors.push_back(format_error(ERR_KEYWORD, tok[1]));
+            continue;
+        }
+
+        // The expression is free text — take it verbatim from the line.
+        // Re-joining the tokenizer's output would drop the ',' between
+        // min/max arguments (the tokenizer treats a comma as a column
+        // separator), turning "MIN(HGW, HCB)" into "MIN(HGW HCB)".
+        std::string_view rest = Tokenizer::strip_comment(line);
+        for (int col = 0; col < 2; ++col) {          // skip Subcatch, Type
+            std::size_t i = 0;
+            while (i < rest.size() && (rest[i] == ' ' || rest[i] == '\t')) ++i;
+            if (i < rest.size() && rest[i] == '"') {
+                ++i;
+                while (i < rest.size() && rest[i] != '"') ++i;
+                if (i < rest.size()) ++i;
+            } else {
+                while (i < rest.size() && rest[i] != ' ' && rest[i] != '\t' &&
+                       rest[i] != ',') ++i;
+            }
+            while (i < rest.size() && (rest[i] == ' ' || rest[i] == '\t')) ++i;
+            if (i < rest.size() && rest[i] == ',') ++i;  // optional CSV comma
+            rest.remove_prefix(i);
+        }
+        std::string expr(Tokenizer::trim(rest));
+
+        // mathexpr::parse is lenient (unknown identifiers evaluate to 0.0),
+        // so reject malformed expressions here like legacy ERR_MATH_EXPR.
+        std::string msg;
+        int col = -1;
+        if (groundwater::gwf_validate(expr, msg, col) != 0) {
+            ctx.errors.push_back(format_error(ERR_MATH_EXPR, "",
+                "in [GWF] " + type + " for Subcatchment " + subcatch + ": " + msg));
+            continue;
         }
 
         std::string key = "GWF:" + subcatch + ":" + type;

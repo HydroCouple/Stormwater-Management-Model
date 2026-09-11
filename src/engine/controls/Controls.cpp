@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright 2026 Caleb Buahin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /**
  * @file Controls.cpp
  * @brief Rule-based control engine — full legacy parity implementation.
@@ -5,7 +21,7 @@
  *
  * @author   Caleb Buahin <caleb.buahin@gmail.com>
  * @copyright Copyright (c) 2026 Caleb Buahin. All rights reserved.
- * @license  MIT License
+ * @license  Apache-2.0
  */
 
 #include "Controls.hpp"
@@ -315,15 +331,23 @@ int ControlEngine::applyPendingActions(SimulationContext& ctx, double current_ti
             // the report — match that here (P1-C08).
             if (ctx.options.rpt_controls &&
                 kv.second.type == ActionType::NUMERIC) {
-                int ri = kv.second.rule_idx;
-                std::string rname = (ri >= 0 && ri < static_cast<int>(rules_.size()))
-                    ? rules_[static_cast<std::size_t>(ri)].name : "Rule?";
+                const int  ri    = kv.second.rule_idx;
+                const bool known = ri >= 0 && ri < static_cast<int>(rules_.size());
+                if (known) {
+                    // Intern the rule name once; the entry carries the index
+                    // (no per-action string on a deck that toggles every step).
+                    auto& names = ctx.control_rule_names;
+                    if (names.size() < rules_.size()) names.resize(rules_.size());
+                    auto& slot = names[static_cast<std::size_t>(ri)];
+                    if (slot != rules_[static_cast<std::size_t>(ri)].name)
+                        slot = rules_[static_cast<std::size_t>(ri)].name;
+                }
                 SimulationContext::ControlLogEntry entry;
                 entry.link_idx    = kv.first;
-                entry.rule_name   = std::move(rname);
+                entry.rule_idx    = known ? ri : -1;
                 entry.new_setting = kv.second.value;
                 entry.date        = ctx.current_date;
-                ctx.control_log.push_back(std::move(entry));
+                ctx.logControlAction(entry);
             }
             changes++;
         }
@@ -1258,10 +1282,16 @@ int ControlEngine::parseRuleText(const std::string& text, SimulationContext& ctx
                             "' exists in the model");
             k++;
 
-            // Parse attribute (STATUS or SETTING)
+            // Parse attribute — legacy addAction (controls.c) accepts only
+            // STATUS or SETTING as an action attribute; any other keyword (e.g.
+            // FLOW) is ERR_KEYWORD. v6 formerly swallowed any attribute as a
+            // numeric setting.
             if (k >= static_cast<int>(toks.size()))
                 return fail("action is missing its attribute (STATUS or SETTING)");
             std::string attr = to_upper(toks[static_cast<size_t>(k)]);
+            if (attr != "STATUS" && attr != "SETTING")
+                return fail("'" + toks[static_cast<size_t>(k)] + "' is not a valid "
+                            "action attribute (expected STATUS or SETTING)");
             k++;
 
             // Skip '=' token
